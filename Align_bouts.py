@@ -84,34 +84,41 @@ def prepare_df(df, group_col, start_col, end_col, extra_cols):
     out["_start_s"]  = out["_start_dt"].astype(np.int64) // 10**9
     out["_end_s"]    = out["_end_dt"].astype(np.int64)   // 10**9
     out["_dur_s"]    = out["_end_s"] - out["_start_s"]
-    return out[out["_dur_s"] > 0].reset_index(drop=True)
+    out = out[out["_dur_s"] > 0].reset_index(drop=True)
+    out["_bout_id"]  = out["_group"].astype(str) + "_" + (out.index + 1).astype(str)
+    return out
 
 
 # grp2_name is used inside categorize; set as a module-level var after UI resolves
 _grp2_label = ""
 
 def categorize(bout, others):
+    """Returns (category_str, matched_bout_ids_str)."""
     s1, e1 = bout["_start_s"], bout["_end_s"]
     overlapping = [o for o in others
                    if min(e1, o["_end_s"]) - max(s1, o["_start_s"]) > 0]
     if len(overlapping) == 0:
-        return "No overlap"
+        return "No overlap", ""
+    ids = ", ".join(str(o.get("_bout_id", "?")) for o in overlapping)
     if len(overlapping) > 1:
-        return "Spans multiple"
+        return "Spans multiple", ids
     o = overlapping[0]
     s2, e2 = o["_start_s"], o["_end_s"]
     if s1 == s2 and e1 == e2:
-        return "Identical"
+        return "Identical", ids
     if s1 >= s2 and e1 <= e2:
-        return f"Within {_grp2_label} bout"
+        return f"Within {_grp2_label} bout", ids
     if s1 <= s2 and e1 >= e2:
-        return f"Contains {_grp2_label} bout"
-    return "Partial overlap"
+        return f"Contains {_grp2_label} bout", ids
+    return "Partial overlap", ids
 
 
 def build_categories(primary_df, reference_df):
     ref = reference_df.to_dict("records")
-    return [categorize(row, ref) for _, row in primary_df.iterrows()]
+    results = [categorize(row, ref) for _, row in primary_df.iterrows()]
+    cats = [r[0] for r in results]
+    match_ids = [r[1] for r in results]
+    return cats, match_ids
 
 
 def second_sets(df):
@@ -274,8 +281,10 @@ if use_animal and animal_col in df1.columns:
 
     # use index-keyed dicts so categories are assigned back to the correct rows
     # regardless of the order animals are iterated
-    cats1_by_idx = {}
-    cats2_by_idx = {}
+    cats1_by_idx  = {}
+    match1_by_idx = {}
+    cats2_by_idx  = {}
+    match2_by_idx = {}
     shared, only1, only2, total1, total2 = 0, 0, 0, 0, 0
     per_animal_results = {}
 
@@ -284,14 +293,16 @@ if use_animal and animal_col in df1.columns:
         a2 = df2[df2[animal_col].astype(str) == animal]
 
         _grp2_label = grp2
-        ac1 = build_categories(a1, a2)
-        for idx, cat in zip(a1.index, ac1):
-            cats1_by_idx[idx] = cat
+        ac1, am1 = build_categories(a1, a2)
+        for idx, cat, mid in zip(a1.index, ac1, am1):
+            cats1_by_idx[idx]  = cat
+            match1_by_idx[idx] = mid
 
         _grp2_label = grp1
-        ac2 = build_categories(a2, a1)
-        for idx, cat in zip(a2.index, ac2):
-            cats2_by_idx[idx] = cat
+        ac2, am2 = build_categories(a2, a1)
+        for idx, cat, mid in zip(a2.index, ac2, am2):
+            cats2_by_idx[idx]  = cat
+            match2_by_idx[idx] = mid
         _grp2_label = grp2
 
         a_shared, a_only1, a_only2, a_total1, a_total2 = dur_shared(a1, a2)
@@ -306,21 +317,23 @@ if use_animal and animal_col in df1.columns:
         }
 
     # reconstruct in original df row order
-    cats1 = [cats1_by_idx[i] for i in df1.index]
-    cats2 = [cats2_by_idx[i] for i in df2.index]
+    cats1   = [cats1_by_idx[i]  for i in df1.index]
+    match1  = [match1_by_idx[i] for i in df1.index]
+    cats2   = [cats2_by_idx[i]  for i in df2.index]
+    match2  = [match2_by_idx[i] for i in df2.index]
 
 else:
     # ── no animal column: compare all bouts directly ───────────────────────
     _grp2_label = grp2
-    cats1 = build_categories(df1, df2)
+    cats1, match1 = build_categories(df1, df2)
     _grp2_label = grp1
-    cats2 = build_categories(df2, df1)
+    cats2, match2 = build_categories(df2, df1)
     _grp2_label = grp2
 
     shared, only1, only2, total1, total2 = dur_shared(df1, df2)
 
-df1 = df1.copy(); df1["_cat"] = cats1
-df2 = df2.copy(); df2["_cat"] = cats2
+df1 = df1.copy(); df1["_cat"] = cats1; df1["_match_ids"] = match1
+df2 = df2.copy(); df2["_cat"] = cats2; df2["_match_ids"] = match2
 
 all_cats_seen = sorted(set(cats1) | set(cats2))
 CAT_ORDER_DYNAMIC = (
@@ -380,9 +393,9 @@ with tab_analysis:
         html = (
             f"<table style='width:100%;border-collapse:collapse;'>"
             f"<thead><tr>"
-            f"<th style='font-size:24px;padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;'>Category</th>"
-            f"<th style='font-size:24px;padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;'>Bouts</th>"
-            f"<th style='font-size:24px;padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;'>%</th>"
+            f"<th style='font-size:20px;padding:8px 12px;text-align:left;border-bottom:2px solid #ddd;'>Category</th>"
+            f"<th style='font-size:20px;padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;'>Bouts</th>"
+            f"<th style='font-size:20px;padding:8px 12px;text-align:right;border-bottom:2px solid #ddd;'>%</th>"
             f"</tr></thead><tbody>{rows_html}</tbody></table>"
         )
         return html
@@ -446,13 +459,16 @@ with tab_analysis:
     # ── bout-level detail table ───────────────────────────────────────────
     st.markdown("<h2>Bout-level details</h2>", unsafe_allow_html=True)
 
-    keep = ["_group", "_start_raw", "_end_raw", "_dur_s", "_cat"] + extra_cols
+    keep = ["_bout_id", "_group", "_start_raw", "_end_raw", "_dur_s",
+            "_cat", "_match_ids"] + extra_cols
     keep = [c for c in keep if c in df1.columns]
     combined = pd.concat([df1[keep].copy(), df2[keep].copy()])
     combined = combined.sort_values("_start_raw").reset_index(drop=True)
     combined = combined.rename(columns={
-        "_group": "Group", "_start_raw": "Start", "_end_raw": "End",
-        "_dur_s": "Duration (s)", "_cat": "Category"
+        "_bout_id": "Bout ID", "_group": "Group",
+        "_start_raw": "Start", "_end_raw": "End",
+        "_dur_s": "Duration (s)", "_cat": "Category",
+        "_match_ids": "Overlaps with"
     })
 
     st.dataframe(
