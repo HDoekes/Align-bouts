@@ -81,8 +81,9 @@ def prepare_df(df, group_col, start_col, end_col, extra_cols):
                                end_col:   "_end_raw"})
     out["_start_dt"] = pd.to_datetime(out["_start_raw"], dayfirst=True)
     out["_end_dt"]   = pd.to_datetime(out["_end_raw"],   dayfirst=True)
-    out["_start_s"]  = out["_start_dt"].astype(np.int64) // 10**9
-    out["_end_s"]    = out["_end_dt"].astype(np.int64)   // 10**9
+    _epoch = pd.Timestamp("1970-01-01")
+    out["_start_s"]  = (out["_start_dt"] - _epoch).dt.total_seconds().astype(int)
+    out["_end_s"]    = (out["_end_dt"]   - _epoch).dt.total_seconds().astype(int)
     out["_dur_s"]    = out["_end_s"] - out["_start_s"]
     out = out[out["_dur_s"] > 0].reset_index(drop=True)
     out["_bout_id"]  = out["_group"].astype(str) + "_" + (out.index + 1).astype(str)
