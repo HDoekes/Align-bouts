@@ -147,6 +147,10 @@ def cat_color(cat):
 
 # ── sidebar ───────────────────────────────────────────────────────────────────
 
+# safe defaults — overwritten inside sidebar if data is loaded
+use_bout_len = False
+bout_len_col = "(none)"
+
 with st.sidebar:
     st.markdown("<h2>Data & settings</h2>", unsafe_allow_html=True)
 
@@ -213,6 +217,27 @@ with st.sidebar:
                     help="If set, bouts are only compared to bouts of the same animal in the other group."
                 )
                 use_animal = animal_col != animal_none
+
+                st.markdown("---")
+                st.markdown("**Bout length validation (optional)**")
+                bout_len_none = "(none)"
+                # use all raw columns so bout_length_in_s is always available
+                # even if not added to extra_cols
+                bout_len_options = [bout_len_none] + df_raw.columns.tolist()
+                default_bl = next(
+                    (c for c in cols if "length" in c.lower() or "bout_len" in c.lower()),
+                    None
+                )
+                default_bl_idx = (bout_len_options.index(default_bl)
+                                  if default_bl and default_bl in bout_len_options else 0)
+                bout_len_col = st.selectbox(
+                    "Bout length column to validate against",
+                    bout_len_options,
+                    index=default_bl_idx,
+                    help="If set, computed duration (end − start) is compared to this column and mismatches are flagged."
+                )
+                use_bout_len = bout_len_col != bout_len_none
+
                 data_ready = True
         except Exception as e:
             st.error(f"Could not parse timestamps: {e}")
@@ -242,42 +267,32 @@ df2 = df_prep[df_prep["_group"] == grp2].reset_index(drop=True)
 
 def dur_shared(a1, a2):
     """
-    Compute shared / only1 / only2 seconds by direct interval intersection,
-    no deduplication needed — bouts within the same observer+animal do not
-    overlap by construction.
+    Compute shared / only1 / only2 seconds by converting each group's bouts
+    into a set of integer seconds and using set operations.  This is simple,
+    correct by construction, and immune to interval-ordering bugs.
+    Bouts within the same observer+animal do not overlap, so there is no
+    double-counting risk within a group.
     """
-    # collect intervals as sorted list of (start, end) in epoch-seconds
-    def intervals(df):
-        return sorted(zip(df["_start_s"].astype(int), df["_end_s"].astype(int)))
+    def to_set(df):
+        s = set()
+        for _, r in df.iterrows():
+            s.update(range(int(r["_start_s"]), int(r["_end_s"])))
+        return s
 
-    def total_dur(ivs):
-        return sum(e - s for s, e in ivs)
-
-    def intersect(ivs1, ivs2):
-        """Sum of pairwise overlapping seconds between two interval lists."""
-        total = 0
-        j = 0
-        for s1, e1 in ivs1:
-            while j < len(ivs2) and ivs2[j][1] <= s1:
-                j += 1
-            k = j
-            while k < len(ivs2) and ivs2[k][0] < e1:
-                total += min(e1, ivs2[k][1]) - max(s1, ivs2[k][0])
-                k += 1
-        return total
-
-    iv1 = intervals(a1)
-    iv2 = intervals(a2)
-    a_shared = intersect(iv1, iv2)
-    a_total1 = total_dur(iv1)
-    a_total2 = total_dur(iv2)
-    return a_shared, a_total1 - a_shared, a_total2 - a_shared, a_total1, a_total2
+    s1 = to_set(a1)
+    s2 = to_set(a2)
+    a_shared = len(s1 & s2)
+    a_only1  = len(s1 - s2)
+    a_only2  = len(s2 - s1)
+    a_total1 = a_shared + a_only1   # == len(s1)
+    a_total2 = a_shared + a_only2   # == len(s2)
+    return a_shared, a_only1, a_only2, a_total1, a_total2
 
 
 if use_animal and animal_col in df1.columns:
     # ── per-animal comparison ──────────────────────────────────────────────
-    animals = sorted(set(df1[animal_col].dropna().astype(str).unique()) |
-                     set(df2[animal_col].dropna().astype(str).unique()))
+    animals = sorted(set(df1[animal_col].astype(str).unique()) |
+                     set(df2[animal_col].astype(str).unique()))
 
     # use index-keyed dicts so categories are assigned back to the correct rows
     # regardless of the order animals are iterated
@@ -322,6 +337,10 @@ if use_animal and animal_col in df1.columns:
     cats2   = [cats2_by_idx[i]  for i in df2.index]
     match2  = [match2_by_idx[i] for i in df2.index]
 
+    # totals should always equal the full _dur_s sum regardless of loop accumulation
+    total1 = int(df1["_dur_s"].sum())
+    total2 = int(df2["_dur_s"].sum())
+
 else:
     # ── no animal column: compare all bouts directly ───────────────────────
     _grp2_label = grp2
@@ -350,6 +369,69 @@ tab_analysis, tab_timeline = st.tabs(["📊 Analysis", "🔍 Timeline"])
 # TAB 1 – ANALYSIS
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_analysis:
+
+    # ── bout length validation ───────────────────────────────────────────
+    if use_bout_len and bout_len_col in df_prep.columns:
+        st.markdown("<h2>📋 Bout duration validation</h2>", unsafe_allow_html=True)
+        st.markdown(
+            f"Comparing computed duration (`end_time − start_time`) "
+            f"against the `{bout_len_col}` column."
+        )
+
+        # merge reported length from df_raw if not already in df_prep
+        val_df = df_prep.copy()
+        if bout_len_col not in val_df.columns:
+            val_df["_reported_s"] = pd.to_numeric(
+                df_raw[bout_len_col].iloc[val_df.index].values, errors="coerce"
+            )
+        else:
+            val_df["_reported_s"] = pd.to_numeric(val_df[bout_len_col], errors="coerce")
+        val_df["_diff_s"]     = val_df["_dur_s"] - val_df["_reported_s"]
+        mismatches = val_df[val_df["_diff_s"].abs() > 0].copy()
+
+        mc1, mc2, mc3 = st.columns(3)
+        mc1.metric("Total bouts",     f"{len(val_df):,}")
+        mc2.metric("Matching",        f"{len(val_df) - len(mismatches):,}")
+        mc3.metric("Mismatches",      f"{len(mismatches):,}",
+                   delta=None if len(mismatches)==0 else f"{len(mismatches)} need review",
+                   delta_color="off")
+
+        if len(mismatches) > 0:
+            show_cols = ["_bout_id", "_group", "_start_raw", "_end_raw",
+                         "_dur_s", "_reported_s", "_diff_s"] + (
+                         [animal_col] if use_animal and animal_col in mismatches.columns else []
+                        )
+            show_cols = [c for c in show_cols if c in mismatches.columns]
+            disp = mismatches[show_cols].rename(columns={
+                "_bout_id":     "Bout ID",
+                "_group":       "Group",
+                "_start_raw":   "Start",
+                "_end_raw":     "End",
+                "_dur_s":       "Computed (s)",
+                "_reported_s":  f"Reported (s)",
+                "_diff_s":      "Diff (s)",
+            })
+
+            def highlight_diff(val):
+                if isinstance(val, (int, float)) and val != 0:
+                    return "color: #e24b4a; font-weight: 600;"
+                return ""
+
+            st.dataframe(
+                disp.style.map(highlight_diff, subset=["Diff (s)"]),
+                use_container_width=True, hide_index=True, height=300
+            )
+
+            csv_mm = disp.to_csv(index=False).encode()
+            st.download_button("⬇️ Download mismatches CSV",
+                               data=csv_mm,
+                               file_name="duration_mismatches.csv",
+                               mime="text/csv",
+                               key="dl_mismatches")
+        else:
+            st.success("✅ All computed durations match the reported bout lengths.")
+
+        st.divider()
 
     if use_animal and animal_col in df1.columns:
         n_animals = len(set(df1[animal_col].dropna().astype(str)) |
@@ -416,6 +498,17 @@ with tab_analysis:
         f"**{grp1}**: {shared:,} + {only1:,} = {total1:,}s &nbsp;|&nbsp; "
         f"**{grp2}**: {shared:,} + {only2:,} = {total2:,}s"
     )
+    raw1 = int(df1["_dur_s"].sum())
+    raw2 = int(df2["_dur_s"].sum())
+    if total1 != raw1 or total2 != raw2:
+        st.warning(
+            f"⚠️ Duration mismatch detected. "
+            f"Interval-sum: {grp1}={total1:,}s, {grp2}={total2:,}s. "
+            f"Bout-length sum: {grp1}={raw1:,}s, {grp2}={raw2:,}s. "
+            f"This can happen if bouts with duration=0 were filtered out, "
+            f"or if start/end times do not match the bout_length column."
+        )
+        total1, total2 = raw1, raw2
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Shared (s)",           f"{shared:,}")
     m2.metric(f"Unique {grp1} (s)",   f"{only1:,}")
